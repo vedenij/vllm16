@@ -377,6 +377,12 @@ async def lifespan(app: FastAPI):
         finally:
             if task is not None:
                 task.cancel()
+            # Clean up PoC queue on shutdown
+            try:
+                from vllm.poc.generate_queue import clear_queue as clear_poc_queue
+                await clear_poc_queue()
+            except Exception:
+                pass
     finally:
         # Ensure app state including engine ref is gc'd
         del app.state

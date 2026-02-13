@@ -1,0 +1,236 @@
+"""Deterministic GPU-based random generation for PoC.
+
+Core primitives for generating reproducible random tensors seeded by
+(block_hash, public_key, nonce). Used by the production inference pipeline.
+"""
+import hashlib
+import math
+from typing import List
+
+import torch
+
+
+def _seed_from_string(seed_string: str) -> int:
+    h = hashlib.sha256(seed_string.encode('utf-8')).hexdigest()
+    return int(h[:8], 16)
+
+
+def _murmur3_32(keys: torch.Tensor, seed: int) -> torch.Tensor:
+    """Murmur3 hash for int32 keys. Returns int64 to preserve full uint32 range."""
+    c1, c2 = 0xcc9e2d51, 0x1b873593
+    
+    # Work in int64 to handle uint32 range properly
+    h = torch.full_like(keys, seed & 0xFFFFFFFF, dtype=torch.int64)
+    k = keys.to(torch.int64) & 0xFFFFFFFF
+
+    k = (k * c1) & 0xFFFFFFFF
+    k = ((k << 15) | (k >> 17)) & 0xFFFFFFFF
+    k = (k * c2) & 0xFFFFFFFF
+
+    h = h ^ k
+    h = ((h << 13) | (h >> 19)) & 0xFFFFFFFF
+    h = (h * 5 + 0xe6546b64) & 0xFFFFFFFF
+
+    h = h ^ (h >> 16)
+    h = (h * 0x85ebca6b) & 0xFFFFFFFF
+    h = h ^ (h >> 13)
+    h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+    h = h ^ (h >> 16)
+    return h
+
+
+def _uniform(seed: int, n: int, device: torch.device) -> torch.Tensor:
+    indices = torch.arange(n, device=device, dtype=torch.int32)
+    hashes = _murmur3_32(indices, seed)  # Returns int64 in [0, 2^32)
+    return hashes.to(torch.float32) / 4294967296.0
+
+
+def _normal(seed: int, n: int, device: torch.device) -> torch.Tensor:
+    n_pairs = (n + 1) // 2
+    u = _uniform(seed, n_pairs * 2, device)
+    u1, u2 = u[:n_pairs], u[n_pairs:]
+    u1 = torch.clamp(u1, min=1e-10)
+    z0 = torch.sqrt(-2.0 * torch.log(u1)) * torch.cos(2.0 * math.pi * u2)
+    z1 = torch.sqrt(-2.0 * torch.log(u1)) * torch.sin(2.0 * math.pi * u2)
+    return torch.cat([z0, z1])[:n]
+
+
+def generate_inputs(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    dim: int,
+    seq_len: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Generate deterministic input embeddings for PoC.
+    
+    Args:
+        block_hash: Block hash for seeding
+        public_key: Public key for seeding
+        nonces: List of nonce values
+        dim: Hidden dimension size
+        seq_len: Sequence length
+        device: Target device
+        dtype: Output dtype (default float16)
+    
+    Returns:
+        Tensor of shape [batch_size, seq_len, dim]
+    """
+    batch_size = len(nonces)
+    result = torch.empty(batch_size, seq_len, dim, device=device, dtype=dtype)
+
+    for i, nonce in enumerate(nonces):
+        seed_str = f"{block_hash}_{public_key}_nonce{nonce}"
+        seed = _seed_from_string(seed_str)
+        normal = _normal(seed, seq_len * dim, device)
+        result[i] = normal.view(seq_len, dim).to(dtype)
+
+    return result
+
+
+def generate_target(
+    block_hash: str,
+    public_key: str,
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Generate deterministic target unit vector.
+    
+    Args:
+        block_hash: Block hash for seeding
+        public_key: Public key for seeding
+        dim: Target dimension
+        device: Target device
+        dtype: Output dtype (default float32)
+    
+    Returns:
+        Unit vector of shape [dim]
+    """
+    seed_str = f"{block_hash}_{public_key}_target"
+    seed = _seed_from_string(seed_str)
+    normal = _normal(seed, dim, device)
+    target = normal.to(dtype)
+    target = target / target.norm()
+    return target
+
+
+def generate_householder_vector(
+    seed_str: str,
+    dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate a single unit vector for Householder reflection.
+    
+    Args:
+        seed_str: Seed string for deterministic generation
+        dim: Vector dimension
+        device: Target device
+    
+    Returns:
+        Unit vector of shape [dim]
+    """
+    seed = _seed_from_string(seed_str)
+    v = _normal(seed, dim, device)
+    return v / v.norm()
+
+
+def apply_householder(
+    x: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor:
+    """Apply Householder reflection: H @ x = x - 2*(v·x)*v
+    
+    Args:
+        x: Input tensor of shape [..., dim]
+        v: Unit vector of shape [dim] or [batch, dim]
+    
+    Returns:
+        Transformed tensor of same shape as x
+    """
+    dot = (x * v).sum(dim=-1, keepdim=True)
+    return x - 2 * dot * v
+
+
+def random_pick_indices(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    dim: int,
+    k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Pick k dimensions per nonce deterministically (seed-based).
+    
+    Scores each dimension by a seeded hash and takes the k smallest scores.
+    This yields a deterministic, per-nonce subset without replacement.
+    
+    Args:
+        block_hash: Block hash for seeding
+        public_key: Public key for seeding
+        nonces: List of nonce values
+        dim: Full dimension size
+        k: Number of dimensions to pick
+        device: Target device
+    
+    Returns:
+        Indices tensor of shape [batch_size, k] (int64)
+    """
+    if k <= 0 or k > dim:
+        raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
+
+    batch_size = len(nonces)
+    out = torch.empty(batch_size, k, device=device, dtype=torch.int64)
+    all_idx = torch.arange(dim, device=device, dtype=torch.int32)
+
+    for i, nonce in enumerate(nonces):
+        seed = _seed_from_string(
+            f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
+        )
+        scores = _murmur3_32(all_idx, seed)  # int64
+        # Take k smallest scores via topk on the negated values (O(dim log k)).
+        _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False)
+        out[i] = chosen.to(torch.int64)
+
+    return out
+
+
+def apply_haar_rotation(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    x: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Apply Haar-random rotation via k-1 Householder reflections.
+    
+    Avoids cuSOLVER dependency (no QR decomposition).
+    Each nonce gets a deterministic chain of k-1 reflections.
+    
+    Args:
+        block_hash: Block hash for seeding
+        public_key: Public key for seeding
+        nonces: List of nonce values
+        x: Input vectors of shape [batch_size, k]
+        device: Target device
+    
+    Returns:
+        Rotated vectors of shape [batch_size, k]
+    """
+    batch_size, k = x.shape
+    if k <= 0:
+        raise ValueError(f"k must be positive, got k={k}")
+    
+    y = x.clone()
+    
+    for i, nonce in enumerate(nonces):
+        for j in range(k - 1):
+            v = generate_householder_vector(
+                f"{block_hash}_{public_key}_nonce_{nonce}_haar_hh_{k}_{j}",
+                k, device,
+            )
+            y[i] = apply_householder(y[i], v.to(y.dtype))
+    
+    return y

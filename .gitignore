@@ -18,6 +18,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+build.sh
+Dockerfile.quick
+**/__init__.py
+
 # C extensions
 *.so
 
