@@ -217,6 +217,7 @@ class FlashAttentionMetadata:
     max_num_splits: int = 0
 
     causal: bool = True
+    direct_qkv: bool = False  # PoC: bypass KV cache, use direct Q/K/V
 
 
 def _get_sliding_window_configs(
@@ -667,6 +668,36 @@ class FlashAttentionImpl(AttentionImpl):
                 attn_metadata,
                 layer,
             )
+
+        # PoC direct Q/K/V path — matches v0.9.1 prefill behavior
+        if attn_metadata.direct_qkv:
+            cu_seqlens_q = attn_metadata.query_start_loc
+            descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+            sliding_window_size = (
+                list(self.sliding_window)
+                if self.sliding_window is not None
+                else None
+            )
+            flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key[:num_actual_tokens],
+                v=value[:num_actual_tokens],
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_q,
+                max_seqlen_q=attn_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.max_query_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+            )
+            return output
 
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
