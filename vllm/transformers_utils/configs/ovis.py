@@ -130,8 +130,8 @@ class SiglipVisualTokenizerConfig(BaseVisualTokenizerConfig):
             self.backbone_kwargs["num_hidden_layers"] = self.depths[0]
 
 
-AutoConfig.register("siglip_visual_tokenizer", SiglipVisualTokenizerConfig)
-AutoConfig.register("aimv2_visual_tokenizer", Aimv2VisualTokenizerConfig)
+AutoConfig.register("siglip_visual_tokenizer", SiglipVisualTokenizerConfig, exist_ok=True)
+AutoConfig.register("aimv2_visual_tokenizer", Aimv2VisualTokenizerConfig, exist_ok=True)
 
 
 # ----------------------------------------------------------------------
