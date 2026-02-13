@@ -671,6 +671,26 @@ class FlashAttentionImpl(AttentionImpl):
 
         # PoC direct Q/K/V path — matches v0.9.1 prefill behavior
         if attn_metadata.direct_qkv:
+            from vllm import _custom_ops as ops
+
+            q = query[:num_actual_tokens]
+            k = key[:num_actual_tokens]
+            v = value[:num_actual_tokens]
+
+            # Quantize K/V to FP8 (Q is already FP8 from Attention.forward)
+            if self.kv_cache_dtype.startswith("fp8"):
+                num_kv_tokens, num_kv_heads, head_size = k.shape
+                k, _ = ops.scaled_fp8_quant(
+                    k.reshape(num_kv_tokens,
+                              num_kv_heads * head_size).contiguous(),
+                    layer._k_scale)
+                k = k.reshape(num_kv_tokens, num_kv_heads, head_size)
+                v, _ = ops.scaled_fp8_quant(
+                    v.reshape(num_kv_tokens,
+                              num_kv_heads * head_size).contiguous(),
+                    layer._v_scale)
+                v = v.reshape(num_kv_tokens, num_kv_heads, head_size)
+
             cu_seqlens_q = attn_metadata.query_start_loc
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
             sliding_window_size = (
@@ -679,9 +699,9 @@ class FlashAttentionImpl(AttentionImpl):
                 else None
             )
             flash_attn_varlen_func(
-                q=query[:num_actual_tokens],
-                k=key[:num_actual_tokens],
-                v=value[:num_actual_tokens],
+                q=q,
+                k=k,
+                v=v,
                 out=output[:num_actual_tokens],
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_q,
