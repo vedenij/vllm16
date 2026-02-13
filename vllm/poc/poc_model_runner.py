@@ -10,6 +10,7 @@ barriers or broadcast needed.
 - attn_metadata is dict[str, AttentionMetadata] (per-layer)
 - slot_mapping_dict is empty (no KV cache writes)
 """
+import base64
 import time
 import torch
 from typing import List, Optional, Dict, Any
@@ -236,15 +237,19 @@ def execute_poc_forward(
         # Normalize output vectors
         yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)
 
-        # Convert to FP16 for artifact encoding
+        # Encode vectors as base64 FP16 strings (avoids numpy over msgpack)
         vectors_f16 = yk.half().cpu().numpy()
+        vectors_b64 = [
+            base64.b64encode(vectors_f16[i].tobytes()).decode('ascii')
+            for i in range(batch_size)
+        ]
 
         logger.info(f"[PoC][rank={rank}] execute_poc_forward DONE "
                     f"total={time.time()-t0:.2f}s")
 
         return {
             "nonces": nonces,
-            "vectors": vectors_f16,
+            "vectors_b64": vectors_b64,
         }
 
     except Exception as e:

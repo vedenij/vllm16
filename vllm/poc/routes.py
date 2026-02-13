@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict
 
 from vllm.logger import init_logger
 from .config import PoCState
-from .data import Artifact, encode_vector, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
 from .callbacks import CallbackSender
 from .generate_queue import GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES
 from .validation import run_validation
@@ -265,11 +265,10 @@ async def run_poc_rpc(
     if result is None:
         return {"artifacts": []}
 
-    vectors = result["vectors"]  # FP16 numpy array
+    vectors_b64 = result["vectors_b64"]  # Pre-encoded base64 strings
     artifacts = []
     for i, nonce in enumerate(result["nonces"]):
-        vector_b64 = encode_vector(vectors[i])
-        artifacts.append({"nonce": nonce, "vector_b64": vector_b64})
+        artifacts.append({"nonce": nonce, "vector_b64": vectors_b64[i]})
 
     return {"artifacts": artifacts}
 
