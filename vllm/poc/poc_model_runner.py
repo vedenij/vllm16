@@ -6,11 +6,12 @@ This mimics vLLM's /chat/completion TP synchronization:
 - All TP ranks then enter model forward together (NCCL collectives align)
 
 Key changes from v0.9.1:
-- Removed _create_prefill_attn_metadata (v0.16 has a completely different
-  attention system based on CommonAttentionMetadata + per-layer builders)
-- Uses set_forward_context with attn_metadata=None (PoC forward doesn't
-  need KV cache or proper attention scheduling)
-- Updated worker attribute paths for v0.16 (vllm_config.model_config.dtype)
+- v0.16 separates KV cache update from attention forward. Decoder attention
+  always reads K/V from KV cache (no direct Q/K/V path).
+- We create real FlashAttentionMetadata with real slot mappings and block
+  tables so K/V gets written to cache and read back during attention.
+- attn_metadata is dict[str, AttentionMetadata] (per-layer)
+- slot_mapping is dict[str, torch.Tensor] (per-layer)
 """
 import torch
 import torch.distributed as dist
@@ -20,6 +21,8 @@ from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.communication_op import broadcast_tensor_dict
 from vllm.forward_context import set_forward_context
 from vllm.sequence import IntermediateTensors
+from vllm.model_executor.layers.attention import Attention
+from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
 from .gpu_random import (
     generate_inputs,
@@ -30,6 +33,91 @@ from .layer_hooks import LayerHouseholderHook, poc_forward_context
 
 # Default k_dim (can be overridden per-request)
 DEFAULT_K_DIM = 12
+
+
+def _create_poc_attn_context(worker, batch_size, seq_len, device):
+    """Create real attention metadata + slot mappings for PoC forward.
+
+    In v0.16, decoder attention always reads K/V from the KV cache via
+    block_table. We borrow the first N blocks of the already-allocated
+    cache to store K/V during the forward pass.
+
+    Returns:
+        (attn_metadata_dict, slot_mapping_dict) — both are
+        dict[str, ...] keyed by attention layer name.
+    """
+    vllm_config = worker.vllm_config
+    # static_forward_context maps layer_name -> various modules (Attention,
+    # MoE, Mamba, etc). Filter to only Attention layers.
+    forward_ctx = vllm_config.compilation_config.static_forward_context
+    attn_layers = {
+        name: layer for name, layer in forward_ctx.items()
+        if isinstance(layer, Attention)
+    }
+
+    # Get block_size from the first attention layer's KV cache
+    first_layer_name = next(iter(attn_layers))
+    first_layer = attn_layers[first_layer_name]
+    kv_cache = first_layer.kv_cache[0]  # virtual_engine=0
+    # kv_cache shape: [2, num_blocks, block_size, num_kv_heads, head_size]
+    block_size = kv_cache.shape[2]
+
+    num_tokens = batch_size * seq_len
+    blocks_per_req = (seq_len + block_size - 1) // block_size
+    num_blocks_needed = batch_size * blocks_per_req
+
+    assert num_blocks_needed <= kv_cache.shape[1], (
+        f"PoC needs {num_blocks_needed} blocks but only "
+        f"{kv_cache.shape[1]} available in KV cache"
+    )
+
+    # slot_mapping: linear mapping [0, num_tokens) -> slots in blocks
+    # slot i maps to block (i // block_size), offset (i % block_size)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+
+    # block_table: each request gets its own contiguous blocks
+    block_table = torch.zeros(
+        batch_size, blocks_per_req, dtype=torch.int32, device=device
+    )
+    for i in range(batch_size):
+        start_block = i * blocks_per_req
+        block_table[i] = torch.arange(
+            start_block, start_block + blocks_per_req,
+            dtype=torch.int32, device=device
+        )
+
+    # query_start_loc: [0, seq_len, 2*seq_len, ..., batch_size*seq_len]
+    query_start_loc = torch.arange(
+        0, num_tokens + 1, seq_len, dtype=torch.int32, device=device
+    )
+    seq_lens = torch.full(
+        (batch_size,), seq_len, dtype=torch.int32, device=device
+    )
+
+    attn_metadata = FlashAttentionMetadata(
+        num_actual_tokens=num_tokens,
+        max_query_len=seq_len,
+        query_start_loc=query_start_loc,
+        max_seq_len=seq_len,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        slot_mapping=slot_mapping,
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+        causal=True,
+    )
+
+    # Build per-layer dicts (all attention layers share the same metadata)
+    attn_metadata_dict = {}
+    slot_mapping_dict = {}
+    for layer_name in attn_layers:
+        attn_metadata_dict[layer_name] = attn_metadata
+        slot_mapping_dict[layer_name] = slot_mapping
+
+    return attn_metadata_dict, slot_mapping_dict
 
 
 def _ensure_layer_hooks(worker, block_hash: str, hidden_size: int) -> None:
@@ -136,13 +224,22 @@ def execute_poc_forward(
     # Ensure layer hooks are installed for this block_hash (lazy + cached)
     _ensure_layer_hooks(worker, block_hash, hidden_size)
 
+    # Create real attention metadata so attention computes properly.
+    # In v0.16, decoder attention reads K/V from KV cache via block_table.
+    # We borrow blocks from the already-allocated cache, provide valid
+    # slot mappings so K/V gets written, and valid block_table so
+    # attention reads K/V back. This matches v0.9.1 behavior where
+    # flash_attn_varlen_func computed real attention with Q/K/V.
+    attn_metadata_dict, slot_mapping_dict = _create_poc_attn_context(
+        worker, batch_size, seq_len, device
+    )
+
     # Forward pass with PoC context (activates layer hook transformations)
-    # In v0.16, set_forward_context requires attn_metadata and vllm_config.
-    # We pass attn_metadata=None (profile-run mode): attention layers return
-    # zeros, so hidden states are driven by embeddings + MLP + layer norms +
-    # Householder layer hooks. This is deterministic and sufficient for PoC
-    # artifact generation. skip_compiled=True bypasses torch.compile graphs.
-    with set_forward_context(None, worker_vllm_config, skip_compiled=True):
+    # skip_compiled=True bypasses torch.compile graphs.
+    with set_forward_context(
+        attn_metadata_dict, worker_vllm_config,
+        slot_mapping=slot_mapping_dict, skip_compiled=True,
+    ):
         with poc_forward_context():
             hidden_states = model(
                 input_ids=None,

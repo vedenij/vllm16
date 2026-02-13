@@ -243,13 +243,11 @@ async def run_poc_rpc(
     Returns:
         Dict with "artifacts" key containing list of {nonce, vector_b64} dicts.
     """
-    from .poc_model_runner import execute_poc_forward
-
     # Get hidden_size from engine client's model config
     hidden_size = engine_client.vllm_config.model_config.get_hidden_size()
 
     results = await engine_client.collective_rpc(
-        execute_poc_forward,
+        "execute_poc_forward",
         timeout=timeout_sec,
         args=(
             block_hash,
